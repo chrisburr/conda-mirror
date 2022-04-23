@@ -14,7 +14,9 @@ import tarfile
 import tempfile
 import time
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
+from threading import Semaphore
 from typing import Any, Callable, Dict, Set, Union
 
 import requests
@@ -807,12 +809,6 @@ def _validate_packages(package_repodata, package_directory, num_threads=1):
         # Do serial package validation (Takes a long time for large repos)
         validation_results = map(_validate_or_remove_package, val_func_arg_list)
     else:
-        if num_threads == 0:
-            num_threads = os.cpu_count()
-            logger.debug(
-                "num_threads=0 so it will be replaced by all available "
-                "cores: %s" % num_threads
-            )
         logger.info(
             "Will use {} threads for package validation." "".format(num_threads)
         )
@@ -1009,6 +1005,14 @@ def main(
         "blacklisted": set(),
         "to-mirror": set(),
     }
+
+    if num_threads == 0:
+        num_threads = os.cpu_count()
+        logger.debug(
+            "num_threads=0 so it will be replaced by all available "
+            "cores: %s" % num_threads
+        )
+
     # Implementation:
     if not os.path.exists(os.path.join(target_directory, platform)):
         os.makedirs(os.path.join(target_directory, platform))
@@ -1095,12 +1099,21 @@ def main(
     # b. validate contents of temp file
     # c. move to local repo
     # mirror all new packages
+    global total_bytes
     total_bytes = 0
     minimum_free_space_kb = minimum_free_space * 1024 * 1024
     download_url, channel = _maybe_split_channel(upstream_channel)
     session = requests.Session()
-    with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
+    with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir, ThreadPoolExecutor(max_workers=num_threads) as executor:
         logger.info("downloading to the tempdir %s", download_dir)
+        kwargs = dict(
+            proxies=proxies,
+            ssl_verify=ssl_verify,
+            chunk_size=chunk_size,
+            max_retries=max_retries,
+            show_progress=show_progress,
+        )
+        sem = Semaphore(value=num_threads)
         for package_name in tqdm(
             sorted(to_mirror),
             desc=platform,
@@ -1111,42 +1124,8 @@ def main(
             url = download_url.format(
                 channel=channel, platform=platform, file_name=package_name
             )
-            try:
-                # make sure we have enough free disk space in the temp folder to meet threshold
-                if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
-                    logger.error(
-                        "Disk space below threshold in %s. Aborting download.",
-                        download_dir,
-                    )
-                    break
-
-                # download package
-                total_bytes += _download_backoff_retry(
-                    url,
-                    download_dir,
-                    session,
-                    proxies=proxies,
-                    ssl_verify=ssl_verify,
-                    chunk_size=chunk_size,
-                    max_retries=max_retries,
-                    show_progress=show_progress,
-                )
-
-                # make sure we have enough free disk space in the target folder to meet threshold
-                # while also being able to fit the packages we have already downloaded
-                if (
-                    shutil.disk_usage(local_directory).free - total_bytes
-                ) < minimum_free_space_kb:
-                    logger.error(
-                        "Disk space below threshold in %s. Aborting download",
-                        local_directory,
-                    )
-                    break
-
-                summary["downloaded"].add((url, download_dir))
-            except Exception as ex:
-                logger.exception("Unexpected error: %s. Aborting download.", ex)
-                break
+            sem.acquire()
+            executor.submit(_do_download, download_dir, minimum_free_space_kb, url, session, kwargs, local_directory, summary, sem)
 
         # validate all packages in the download directory
         validation_results = _validate_packages(
@@ -1212,6 +1191,45 @@ def _write_repodata(package_dir, repodata_dict):
     bz2_path = os.path.join(package_dir, "repodata.json.bz2")
     with open(bz2_path, "wb") as fo:
         fo.write(bz2.compress(data.encode("utf-8")))
+
+
+def _do_download(download_dir, minimum_free_space_kb, url, session, kwargs, local_directory, summary, sem):
+    global total_bytes
+    try:
+        # make sure we have enough free disk space in the temp folder to meet threshold
+        if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
+            logger.error(
+                "Disk space below threshold in %s. Aborting download.",
+                download_dir,
+            )
+            return False
+
+        # download package
+        total_bytes += _download_backoff_retry(
+            url,
+            download_dir,
+            session,
+            **kwargs,
+        )
+
+        # make sure we have enough free disk space in the target folder to meet threshold
+        # while also being able to fit the packages we have already downloaded
+        if (
+            shutil.disk_usage(local_directory).free - total_bytes
+        ) < minimum_free_space_kb:
+            logger.error(
+                "Disk space below threshold in %s. Aborting download",
+                local_directory,
+            )
+            return False
+
+        summary["downloaded"].add((url, download_dir))
+    except Exception as ex:
+        logger.exception("Unexpected error: %s. Aborting download.", ex)
+        return False
+
+    sem.release()
+    return True
 
 
 if __name__ == "__main__":
